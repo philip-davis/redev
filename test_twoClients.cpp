@@ -112,7 +112,7 @@ void client(redev::Redev& rdv, const int clientId, adios2::Params params, const 
   /// [Client Setup]
   std::stringstream clientName;
   clientName << "client" << clientId;
-  auto commPair = rdv.CreateAdiosClient<redev::LO>(clientName.str(),params,static_cast<redev::TransportType>(isSST));
+  auto commPair = rdv.CreateDSpacesClient<redev::LO>(clientName.str());
 
   //setup outbound message
   std::cout << "sending to server\n";
@@ -150,8 +150,8 @@ void client(redev::Redev& rdv, const int clientId, adios2::Params params, const 
 
 void server(redev::Redev& rdv, adios2::Params params, const bool isSST) {
   /// [Server Create Clients]
-  auto client0 = rdv.CreateAdiosClient<redev::LO>("client0",params,static_cast<redev::TransportType>(isSST));
-  auto client1 = rdv.CreateAdiosClient<redev::LO>("client1",params,static_cast<redev::TransportType>(isSST));
+  auto client0 = rdv.CreateDSpacesClient<redev::LO>("client0");
+  auto client1 = rdv.CreateDSpacesClient<redev::LO>("client1");
   /// [Server Create Clients]
 
   /// [Server First Inbound Messages from Clients]

@@ -16,6 +16,7 @@ endif()
 
 find_package(MPI REQUIRED)
 #adios2 adds C and Fortran depending on how it was built
+find_package(dspaces REQUIRED)
 find_package(ADIOS2 CONFIG 2.7.1 REQUIRED)
 
 set(REDEV_HEADERS
@@ -39,9 +40,9 @@ set(REDEV_SOURCES
   )
 
 add_library(redev ${REDEV_SOURCES})
-target_compile_features(redev PUBLIC cxx_std_17)
+target_compile_features(redev PUBLIC cxx_std_20)
 target_link_libraries(redev PRIVATE redev_git_version)
-target_link_libraries(redev PUBLIC adios2::cxx11_mpi MPI::MPI_C)
+target_link_libraries(redev PUBLIC adios2::cxx11_mpi MPI::MPI_C dspaces::dspaces)
 target_compile_options(redev PRIVATE -Werror=switch)
 if(HAS_ASAN)
   target_compile_options(redev PRIVATE -fsanitize=address -fno-omit-frame-pointer)

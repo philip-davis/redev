@@ -7,6 +7,8 @@
 #include "redev_strings.h"
 #include <array>          // std::array
 #include <variant>
+#include "dspaces.h"
+#include <span>
 
 namespace redev {
 
@@ -156,19 +158,21 @@ class PartitionInterface {
      * @param[in] eng an ADIOS2 Engine opened in write mode
      * @param[in] io the ADIOS2 IO object that created eng
      */
-    virtual void Write(adios2::Engine& eng, adios2::IO& io) = 0;
+    virtual void Write(dspaces_client_t dsp, std::string_view name) = 0;
     /**
      * Read the partition to the provided ADIOS engine/io.
      * @param[in] eng an ADIOS2 Engine opened in read mode
      * @param[in] io the ADIOS2 IO object that created eng
      */
-    virtual void Read(adios2::Engine& eng, adios2::IO& io) = 0;
+    virtual void Read(dspaces_client_t dsp, std::string_view name) = 0;
     /**
      * Send the partition information from the root rank to all other ranks in comm.
      * @param[in] comm MPI communicator containing the ranks that need the partition information
      * @param[in] root the source rank that sends the partition information
      */
     virtual void Broadcast(MPI_Comm comm, int root=0) = 0;
+
+    int metaStep;
 };
 /**
  * The ClassPtn class supports a domain partition defined by the ownership of geometric model entities.
@@ -207,8 +211,8 @@ class ClassPtn : public PartitionInterface {
      */
     [[nodiscard]]
     redev::LO GetRank(ModelEnt ent) const;
-    void Write(adios2::Engine& eng, adios2::IO& io) final;
-    void Read(adios2::Engine& eng, adios2::IO& io) final;
+    void Write(dspaces_client_t dsp, std::string_view name) final;
+    void Read(dspaces_client_t dsp, std::string_view name) final;
     void Broadcast(MPI_Comm comm, int root=0) final;
     /**
      * Return the vector of owning ranks for all geometric model entity.
@@ -239,7 +243,7 @@ class ClassPtn : public PartitionInterface {
      * construct the ModelEntToRank map
      */
     [[nodiscard]]
-    ModelEntToRank DeserializeModelEntsAndRanks(const redev::LOs& serialized) const;
+    ModelEntToRank DeserializeModelEntsAndRanks(const std::span<redev::LO> serialized) const;
     /**
      * Ensure that the dimensions of the model ents is [0:3]
      */
@@ -291,8 +295,8 @@ class RCBPtn : public PartitionInterface {
      * @param[in] pt the cartesian point in space. The 3rd value is ignored for 2d domains.
      */
     redev::LO GetRank(std::array<redev::Real,3>& pt) const;
-    void Write(adios2::Engine& eng, adios2::IO& io) final;
-    void Read(adios2::Engine& eng, adios2::IO& io) final;
+    void Write(dspaces_client_t dsp, std::string_view name) final;
+    void Read(dspaces_client_t dsp, std::string_view name) final;
     void Broadcast(MPI_Comm comm, int root=0) final;
     /**
      * Return the vector of owning ranks for each sub-domain of the cut tree.
@@ -383,17 +387,17 @@ class Redev {
      * @param[in] transportType by default the BP4 Engine is used, other transport
      * types are available in the TransportType enum
      */
+    ~Redev();
     template<typename T>
-    BidirectionalComm<T> CreateAdiosClient(std::string_view name, adios2::Params params,
-                                  TransportType transportType = TransportType::BP4);
+    BidirectionalComm<T> CreateDSpacesClient(std::string_view name);
     [[nodiscard]]
     ProcessType GetProcessType() const;
     [[nodiscard]]
     const Partition & GetPartition() const;
 
   private:
-    void Setup(adios2::IO& s2cIO, adios2::Engine& s2cEngine);
-    void CheckVersion(adios2::Engine& eng, adios2::IO& io);
+    void Setup(std::string_view name);
+    void CheckVersion(std::string_view name);
     ProcessType processType;
     bool noClients; // true: no clients will be connected, false: otherwise
     void openEnginesBP4(bool noClients,
@@ -404,60 +408,22 @@ class Redev {
         std::string s2cName, std::string c2sName,
         adios2::IO& s2cIO, adios2::IO& c2sIO,
         adios2::Engine& s2cEngine, adios2::Engine& c2sEngine);
-    redev::LO GetServerCommSize(adios2::IO& s2cIO, adios2::Engine& s2cEngine);
-    redev::LO GetClientCommSize(adios2::IO& c2sIO, adios2::Engine& c2sEngine);
+    redev::LO GetServerCommSize(std::string_view name);
+    redev::LO GetClientCommSize(std::string_view name);
     MPI_Comm comm;
-    adios2::ADIOS adios;
     int rank;
     Partition ptn;
+    dspaces_client_t dsp;
 };
 
 template<typename T>
-BidirectionalComm<T> Redev::CreateAdiosClient(std::string_view name, adios2::Params params,
-                                     TransportType transportType) {
-  auto s2cName = std::string(name)+"_s2c";
-  auto c2sName = std::string(name)+"_c2s";
-  auto s2cIO = adios.DeclareIO(s2cName);
-  auto c2sIO = adios.DeclareIO(c2sName);
-  if(transportType == TransportType::SST && noClients == true) {
-    // TODO log message here
-    transportType = TransportType::BP4;
-  }
+BidirectionalComm<T> Redev::CreateDSpacesClient(std::string_view name) {
   std::string engineType;
-  switch (transportType) {
-    case TransportType::BP4 :
-      engineType = "BP4";
-      break;
-    case TransportType::SST:
-      engineType = "SST";
-      break;
-    // no default case. This will cause a compiler error if we do not handle a
-    // an engine type that has been defined in the TransportType enum. (-Werror=switch)
-  }
-  s2cIO.SetEngine(engineType);
-  c2sIO.SetEngine(engineType);
-  s2cIO.SetParameters(params);
-  c2sIO.SetParameters(params);
-  REDEV_ALWAYS_ASSERT(s2cIO.EngineType() == c2sIO.EngineType());
-  adios2::Engine s2cEngine;
-  adios2::Engine c2sEngine;
-  switch (transportType) {
-    case TransportType::BP4 :
-      openEnginesBP4(noClients,s2cName+".bp",c2sName+".bp",
-                     s2cIO,c2sIO,s2cEngine,c2sEngine);
-      break;
-    case TransportType::SST:
-      openEnginesSST(noClients,s2cName,c2sName,
-                     s2cIO,c2sIO,s2cEngine,c2sEngine);
-      break;
-    // no default case. This will cause a compiler error if we do not handle a
-    // an engine type that has been defined in the TransportType enum. (-Werror=switch)
-  }
-  Setup(s2cIO,s2cEngine);
-  const auto serverRanks = GetServerCommSize(s2cIO,s2cEngine);
-  const auto clientRanks = GetClientCommSize(c2sIO,c2sEngine);
-  auto s2c = std::make_unique<AdiosComm<T>>(comm, clientRanks, s2cEngine, s2cIO, std::string(name)+"_s2c");
-  auto c2s = std::make_unique<AdiosComm<T>>(comm, serverRanks, c2sEngine, c2sIO, std::string(name)+"_c2s");
+  Setup(name);
+  const auto serverRanks = GetServerCommSize(name);
+  const auto clientRanks = GetClientCommSize(name);
+  auto s2c = std::make_unique<DSpacesComm<T>>(comm, clientRanks, dsp, std::string(name)+"_s2c");
+  auto c2s = std::make_unique<DSpacesComm<T>>(comm, serverRanks, dsp, std::string(name)+"_c2s");
   switch (processType) {
     case ProcessType::Client:
       return {std::move(c2s), std::move(s2c)};

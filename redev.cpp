@@ -1,5 +1,6 @@
 #include <redev.h>
 #include <cassert>
+#include <span>
 #include "redev_git_version.h"
 #include "redev.h"
 #include "redev_profile.h"
@@ -7,6 +8,7 @@
 #include <thread>         // std::this_thread::sleep_for
 #include <chrono>         // std::chrono::seconds
 #include <string>         // std::stoi
+#include <cstring>
 
 namespace {
   //Wait for the file to be created by the writer.
@@ -37,6 +39,7 @@ namespace redev {
       modelEntToRank[ents[i]] = ranks_[i];
     }
     Gather(comm);
+    metaStep = 0;
   }
 
   void ClassPtn::Gather(MPI_Comm comm, int root) {
@@ -116,7 +119,7 @@ namespace redev {
     return entsAndRanks;
   }
 
-  ClassPtn::ModelEntToRank ClassPtn::DeserializeModelEntsAndRanks(const redev::LOs& serialized) const {
+  ClassPtn::ModelEntToRank ClassPtn::DeserializeModelEntsAndRanks(const std::span<redev::LO> serialized) const {
     REDEV_FUNCTION_TIMER;
     const auto stride = 3;
     REDEV_ALWAYS_ASSERT(serialized.size()%stride==0);
@@ -135,29 +138,28 @@ namespace redev {
     return me2r;
   }
 
-  void ClassPtn::Write(adios2::Engine& eng, adios2::IO& io) {
+  void ClassPtn::Write(dspaces_client_t dsp, std::string_view name) {
     REDEV_FUNCTION_TIMER;
+    char var_name[256];
+    uint64_t lb, ub;
     auto serialized = SerializeModelEntsAndRanks();
-    const auto len = serialized.size();
-    auto entsAndRanksVar = io.DefineVariable<redev::LO>(entsAndRanksVarName,{},{},{len});
-    eng.Put(entsAndRanksVar, serialized.data());
-    eng.PerformPuts();
+    uint64_t len = serialized.size();
+    sprintf(var_name, "%s_%s", name.data(), entsAndRanksVarName.c_str());
+    dspaces_put_meta(dsp, var_name, metaStep++, serialized.data(), sizeof(decltype(serialized)::value_type) * len);
   }
 
-  void ClassPtn::Read(adios2::Engine& eng, adios2::IO& io) {
+  void ClassPtn::Read(dspaces_client_t dsp, std::string_view name) {
     REDEV_FUNCTION_TIMER;
-    const auto step = eng.CurrentStep();
-    auto entsAndRanksVar = io.InquireVariable<redev::LO>(entsAndRanksVarName);
-    assert(entsAndRanksVar);
-
-    auto blocksInfo = eng.BlocksInfo(entsAndRanksVar,step);
-    assert(blocksInfo.size()==1);
-    entsAndRanksVar.SetBlockSelection(blocksInfo[0].BlockID);
-    redev::LOs serialized;
-    eng.Get(entsAndRanksVar, serialized);
-    eng.PerformGets(); //default read mode is deferred
-
-    modelEntToRank = DeserializeModelEntsAndRanks(serialized);
+    char var_name[256];
+    int step;
+    redev::LO *entAndRanks;
+    unsigned int size, len;
+    sprintf(var_name, "%s_%s", name.data(), entsAndRanksVarName.c_str());
+    dspaces_get_meta(dsp, var_name, META_MODE_LAST, -1, &step, (void **)&entAndRanks, &size);
+    assert(size && size % sizeof(redev::LO) == 0);
+    len = size / sizeof(redev::LO);
+    modelEntToRank = DeserializeModelEntsAndRanks(std::span<redev::LO>(entAndRanks, len));
+    free(entAndRanks);
   }
 
   void ClassPtn::Broadcast(MPI_Comm comm, int root) {
@@ -183,6 +185,7 @@ namespace redev {
   RCBPtn::RCBPtn(redev::LO dim_)
     : dim(dim_) {
     assert(dim>0 && dim<=3);
+    metaStep = 0;
   }
 
   RCBPtn::RCBPtn(redev::LO dim_, std::vector<int>& ranks_, std::vector<double>& cuts_)
@@ -222,35 +225,40 @@ namespace redev {
     return cuts;
   }
 
-  void RCBPtn::Write(adios2::Engine& eng, adios2::IO& io) {
+  void RCBPtn::Write(dspaces_client_t dsp, std::string_view name) {
     REDEV_FUNCTION_TIMER;
-    const auto len = ranks.size();
+    char var_name[256];
+    uint64_t lb, ub;
+    uint64_t len = ranks.size();
     if(!len) return; //don't attempt zero length write
     assert(len==cuts.size());
-    auto ranksVar = io.DefineVariable<redev::LO>(ranksVarName,{},{},{len});
-    auto cutsVar = io.DefineVariable<redev::Real>(cutsVarName,{},{},{len});
-    eng.Put(ranksVar, ranks.data());
-    eng.Put(cutsVar, cuts.data());
-    eng.PerformPuts();
+    sprintf(var_name, "%s_%s", name.data(), ranksVarName.c_str());
+    dspaces_put_meta(dsp, var_name, 0, ranks.data(), sizeof(decltype(ranks)::value_type) * len);
+    sprintf(var_name, "%s_%s", name.data(), cutsVarName.c_str());
+    dspaces_put_meta(dsp, var_name, 0, cuts.data(), sizeof(decltype(cuts)::value_type) * len);
   }
 
-  void RCBPtn::Read(adios2::Engine& eng, adios2::IO& io) {
+  void RCBPtn::Read(dspaces_client_t dsp, std::string_view name) {
     REDEV_FUNCTION_TIMER;
-    const auto step = eng.CurrentStep();
-    auto ranksVar = io.InquireVariable<redev::LO>(ranksVarName);
-    auto cutsVar = io.InquireVariable<redev::Real>(cutsVarName);
-    assert(ranksVar && cutsVar);
+    char var_name[256];
+    int step;
+    redev::LO *ranksBuf;
+    redev::Real *cutsBuf;
+    unsigned int size, len;
 
-    auto blocksInfo = eng.BlocksInfo(ranksVar,step);
-    assert(blocksInfo.size()==1);
-    ranksVar.SetBlockSelection(blocksInfo[0].BlockID);
-    eng.Get(ranksVar, ranks);
+    sprintf(var_name,  "%s_%s", name.data(), ranksVarName.c_str());
+    dspaces_get_meta(dsp, var_name, META_MODE_LAST, -1, &step, (void **)&ranksBuf, &size);
+    assert(size && size % sizeof(redev::LO) == 0);
+    len = size / sizeof(redev::LO);
+    ranks.assign(ranksBuf, ranksBuf + len);
+    free(ranksBuf);
 
-    blocksInfo = eng.BlocksInfo(ranksVar,step);
-    assert(blocksInfo.size()==1);
-    ranksVar.SetBlockSelection(blocksInfo[0].BlockID);
-    eng.Get(cutsVar, cuts);
-    eng.PerformGets(); //default read mode is deferred
+    sprintf(var_name,  "%s_%s", name.data(), cutsVarName.c_str());
+    dspaces_get_meta(dsp, var_name, META_MODE_LAST, -1, &step, (void **)&cutsBuf, &size);
+    assert(size && size % sizeof(redev::Real) == 0);
+    len = size / sizeof(redev::Real);
+    cuts.assign(cutsBuf, cutsBuf + len);
+    free(cutsBuf);
   }
 
   void RCBPtn::Broadcast(MPI_Comm comm, int root) {
@@ -325,29 +333,35 @@ namespace redev {
   }
 
   Redev::Redev(MPI_Comm comm, Partition ptn, ProcessType processType, bool noClients)
-    : comm(comm), adios(comm), ptn(ptn), processType(processType), noClients(noClients) {
+    : comm(comm), ptn(ptn), processType(processType), noClients(noClients) {
     REDEV_FUNCTION_TIMER;
     int isInitialized = 0;
     MPI_Initialized(&isInitialized);
     REDEV_ALWAYS_ASSERT(isInitialized);
     MPI_Comm_rank(comm, &rank); //set member var
+    dspaces_init_mpi(comm, &dsp);
   }
 
-  void Redev::Setup(adios2::IO& s2cIO, adios2::Engine& s2cEngine) {
+  Redev::~Redev() {
+    if(rank == 0) {
+        dspaces_kill(dsp);
+    }
+    dspaces_fini(dsp);
+    MPI_Barrier(comm);
+  }
+
+  void Redev::Setup(std::string_view name) {
     REDEV_FUNCTION_TIMER;
-    CheckVersion(s2cEngine,s2cIO);
-    auto status = s2cEngine.BeginStep();
-    REDEV_ALWAYS_ASSERT(status == adios2::StepStatus::OK);
+    CheckVersion(name);
     //rendezvous app rank 0 writes partition info and other apps read
     if(!rank) {
       if(processType==ProcessType::Server) {
-        std::visit([&](auto&& partition){partition.Write(s2cEngine, s2cIO);} ,ptn);
+        std::visit([&](auto&& partition){partition.Write(dsp, name);} ,ptn);
       }
       else {
-        std::visit([&](auto&& partition){partition.Read(s2cEngine, s2cIO);} ,ptn);
+        std::visit([&](auto&& partition){partition.Read(dsp, name);} ,ptn);
       }
     }
-    s2cEngine.EndStep();
     std::visit([&](auto&& partition){partition.Broadcast(comm);} ,ptn);
 
   }
@@ -355,26 +369,27 @@ namespace redev {
   /*
    * return the number of processes in the client's MPI communicator
    */
-  redev::LO Redev::GetClientCommSize(adios2::IO& c2sIO, adios2::Engine& c2sEngine) {
+  redev::LO Redev::GetClientCommSize(std::string_view name) {
     REDEV_FUNCTION_TIMER;
-    int commSize;
+    char var_name[256];
+    int commSize, step;
+    unsigned int size;
+    int *sizeMeta;
     MPI_Comm_size(comm, &commSize);
     const auto varName = "redev client communicator size";
-    auto status = c2sEngine.BeginStep();
-    REDEV_ALWAYS_ASSERT(status == adios2::StepStatus::OK);
     redev::LO clientCommSz = 0;
+    sprintf(var_name, "%s_%s", name.data(), varName);
     if(processType == ProcessType::Client) {
-      auto var = c2sIO.DefineVariable<redev::LO>(varName);
       if(!rank)
-        c2sEngine.Put(var, commSize);
+        dspaces_put_meta(dsp, var_name, 0, &commSize, sizeof(commSize));
     } else {
-      auto var = c2sIO.InquireVariable<redev::LO>(varName);
-      if(var && !rank) {
-        c2sEngine.Get(var, clientCommSz);
-        c2sEngine.PerformGets(); //default read mode is deferred
+      if(!rank) {
+        dspaces_get_meta(dsp, var_name, META_MODE_NEXT, -1, &step, (void **)&sizeMeta, &size);
+        assert(step == 0 && size == sizeof(commSize));
+        clientCommSz = *sizeMeta;
+        free(sizeMeta);
       }
     }
-    c2sEngine.EndStep();
     if(processType==ProcessType::Server)
       redev::Broadcast(&clientCommSz,1,0,comm);
     return clientCommSz;
@@ -383,53 +398,54 @@ namespace redev {
   /*
    * return the number of processes in the server's MPI communicator
    */
-  redev::LO Redev::GetServerCommSize(adios2::IO& s2cIO, adios2::Engine& s2cEngine) {
+  redev::LO Redev::GetServerCommSize(std::string_view name) {
     REDEV_FUNCTION_TIMER;
-    int commSize;
+    char var_name[256];
+    int commSize, step;
+    unsigned int size;
+    int *sizeMeta;
     MPI_Comm_size(comm, &commSize);
     const auto varName = "redev server communicator size";
-    auto status = s2cEngine.BeginStep();
-    REDEV_ALWAYS_ASSERT(status == adios2::StepStatus::OK);
     redev::LO serverCommSz = 0;
+    sprintf(var_name, "%s_%s", name.data(), varName);
     if(processType==ProcessType::Server) {
-      auto var = s2cIO.DefineVariable<redev::LO>(varName);
       if(!rank)
-        s2cEngine.Put(var, commSize);
+          dspaces_put_meta(dsp, var_name, 0, &commSize, sizeof(commSize));
     } else {
-      auto var = s2cIO.InquireVariable<redev::LO>(varName);
-      if(var && !rank) {
-        s2cEngine.Get(var, serverCommSz);
-        s2cEngine.PerformGets(); //default read mode is deferred
+      if(!rank) {
+        dspaces_get_meta(dsp, var_name, META_MODE_NEXT, -1, &step, (void **)&sizeMeta, &size);
+        assert(step == 0 && size == sizeof(commSize));
+        serverCommSz = *sizeMeta;
+        free(sizeMeta);
       }
     }
-    s2cEngine.EndStep();
     if(processType == ProcessType::Client)
       redev::Broadcast(&serverCommSz,1,0,comm);
     return serverCommSz;
   }
 
-  void Redev::CheckVersion(adios2::Engine& eng, adios2::IO& io) {
+  void Redev::CheckVersion(std::string_view name) {
     REDEV_FUNCTION_TIMER;
+    char *inHash;
+    int step;
+    unsigned int size;
+
     const auto hashVarName = "redev git hash";
-    auto status = eng.BeginStep();
-    REDEV_ALWAYS_ASSERT(status == adios2::StepStatus::OK);
     //rendezvous app writes the version it has and other apps read
     if(processType==ProcessType::Server) {
-      auto varVersion = io.DefineVariable<std::string>(hashVarName);
-      if(!rank)
-        eng.Put(varVersion, std::string(redevGitHash));
-    }
-    else {
-      auto varVersion = io.InquireVariable<std::string>(hashVarName);
-      std::string inHash;
-      if(varVersion && !rank) {
-        eng.Get(varVersion, inHash);
-        eng.PerformGets(); //default read mode is deferred
-        std::cout << "inHash " << inHash << "\n";
-        REDEV_ALWAYS_ASSERT(inHash == redevGitHash);
+      if(!rank) {
+          dspaces_put_meta(dsp, hashVarName, 0, (void *)redevGitHash, strlen(redevGitHash) + 1);
       }
     }
-    eng.EndStep();
+    else {
+      if(!rank) {
+        dspaces_get_meta(dsp, hashVarName, META_MODE_NEXT, -1, &step, (void **)&inHash, &size);
+        assert(size);
+        std::cout << "inHash " << inHash << "\n";
+        REDEV_ALWAYS_ASSERT(std::string(inHash) == redevGitHash);
+        free(inHash);
+      }
+    }
   }
   ProcessType Redev::GetProcessType() const { return processType; }
   const Partition &Redev::GetPartition() const {return ptn;}

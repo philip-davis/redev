@@ -7,6 +7,8 @@
 #include <numeric> // accumulate, exclusive_scan
 #include <type_traits> // is_same
 
+#include "dspaces.h"
+
 namespace {
 void checkStep(adios2::StepStatus status) {
   REDEV_ALWAYS_ASSERT(status == adios2::StepStatus::OK);
@@ -324,6 +326,176 @@ class AdiosComm : public Communicator<T> {
     int verbose;
     //receive side state
     InMessageLayout inMsg;
+};
+
+template<typename T>
+class DSpacesComm : public Communicator<T> {
+  public:
+    DSpacesComm(MPI_Comm comm_, int recvRanks_, dspaces_client_t dsp_, std::string name_)
+      : comm(comm_), recvRanks(recvRanks_), name(name_), dsp(dsp_) {
+        inMsg.knownSizes = false;
+        offsetStep = 0;
+        step = 0;
+        offsetPosted = false;
+    }
+    void SetOutMessageLayout(LOs& dest_, LOs& offsets_) {
+      REDEV_FUNCTION_TIMER;
+      outMsg = OutMessageLayout{dest_, offsets_};
+    }
+    void Send(T* msgs) {
+      REDEV_FUNCTION_TIMER;
+      int rank, commSz;
+      uint64_t lb, ub, gdim;
+      MPI_Comm_rank(comm, &rank);
+      MPI_Comm_size(comm, &commSz);
+      GOs degree(recvRanks,0); //TODO ideally, this would not be needed
+      for( auto i=0; i<outMsg.dest.size(); i++) {
+        auto destRank = outMsg.dest[i];
+        assert(destRank < recvRanks);
+        degree[destRank] += outMsg.offsets[i+1] - outMsg.offsets[i];
+      }
+      GOs rdvRankStart(recvRanks,0);
+      auto ret = MPI_Exscan(degree.data(), rdvRankStart.data(), recvRanks,
+          getMpiType(redev::GO()), MPI_SUM, comm);
+      assert(ret == MPI_SUCCESS);
+      if(!rank) {
+        //on rank 0 the result of MPI_Exscan is undefined, set it to zero
+        rdvRankStart = GOs(recvRanks,0);
+      }
+
+      GOs gDegree(recvRanks,0);
+      ret = MPI_Allreduce(degree.data(), gDegree.data(), recvRanks,
+          getMpiType(redev::GO()), MPI_SUM, comm);
+      assert(ret == MPI_SUCCESS);
+      const size_t gDegreeTot = static_cast<size_t>(std::accumulate(gDegree.begin(), gDegree.end(), redev::GO(0)));
+
+      GOs gStart(recvRanks,0);
+      redev::exclusive_scan(gDegree.begin(), gDegree.end(), gStart.begin(), redev::GO(0));
+
+      //send dest rank offsets array from rank 0
+      auto offsets = gStart;
+      offsets.push_back(gDegreeTot);
+      if(!offsetPosted) {
+        if(!rank) {
+            const auto offsetsName = name+"_offsets";
+            const auto oCount = offsets.size();
+            dspaces_put_meta(dsp, offsetsName.c_str(), offsetStep, offsets.data(), sizeof(decltype(offsets)::value_type) * oCount);
+        
+            const auto srcCountName = name + "_srcCount";
+            dspaces_put_meta(dsp, srcCountName.c_str(), offsetStep, &commSz, sizeof(commSz));
+        }
+      
+
+        const auto srcRanksName = name+"_srcRanks";
+        uint64_t gdim = commSz * recvRanks;
+        dspaces_define_gdim(dsp, srcRanksName.c_str(), 1, &gdim);
+        lb = recvRanks * rank;
+        ub = lb + (recvRanks - 1);
+        dspaces_put_local(dsp, srcRanksName.c_str(), offsetStep++, sizeof(decltype(rdvRankStart)::value_type), 1, &lb, &ub, rdvRankStart.data());
+
+        offsetPosted = true;
+
+        gdim = gDegreeTot;
+        dspaces_define_gdim(dsp, name.c_str(), 1, &gdim);
+      }
+      
+      //assume one call to pack from each rank for now
+      for( auto i=0; i<outMsg.dest.size(); i++ ) {
+        const auto destRank = outMsg.dest[i];
+        const auto lStart = gStart[destRank]+rdvRankStart[destRank];
+        const auto lCount = outMsg.offsets[i+1]-outMsg.offsets[i];
+        if( lCount > 0 ) {
+          lb = lStart;
+          ub = lb + (lCount - 1);
+          dspaces_put_local(dsp, name.c_str(), step, sizeof(*msgs), 1, &lb, &ub, &(msgs[outMsg.offsets[i]]));
+        }
+      }
+      step++;
+    }
+    std::vector<T> Recv() {
+      REDEV_FUNCTION_TIMER;
+      int rank, commSz;
+      unsigned int size, len;
+      uint64_t lb, ub, gdim;
+      MPI_Comm_rank(comm, &rank);
+      MPI_Comm_size(comm, &commSz);
+      auto t1 = redev::getTime();
+
+      if(!inMsg.knownSizes) {
+        const auto offsetsName = name+"_offsets";
+        redev::GO *offsetsBuf;
+        dspaces_get_meta(dsp, offsetsName.c_str(), META_MODE_NEXT, -1, &offsetStep, (void **)&offsetsBuf, &size);
+        assert(offsetStep == 0 && size % sizeof(redev::GO) == 0);
+        len = size / sizeof(redev::GO);
+        inMsg.offset.assign(offsetsBuf, offsetsBuf + len);
+        free(offsetsBuf);
+
+        const auto srcCountName = name + "_srcCount";
+        int commSz, *commSzBuf; 
+        dspaces_get_meta(dsp, srcCountName.c_str(), META_MODE_NEXT, -1, &offsetStep, (void **)&commSzBuf, &size);
+        commSz = *commSzBuf;
+        free(commSzBuf);
+
+        const auto srcRanksName = name + "_srcRanks";
+        lb = 0;
+        ub = ((inMsg.offset.size() - 1) * commSz) - 1;
+        inMsg.srcRanks.resize((inMsg.offset.size() - 1) * commSz);
+        gdim = ub + 1;
+        dspaces_define_gdim(dsp, srcRanksName.c_str(), 1, &gdim);
+        dspaces_get(dsp, srcRanksName.c_str(), 0, sizeof(redev::GO), 1, &lb, &ub, inMsg.srcRanks.data(), -1); 
+
+        inMsg.start = static_cast<size_t>(inMsg.offset[rank]);
+        inMsg.count = static_cast<size_t>(inMsg.offset[rank+1]-inMsg.start);
+        inMsg.knownSizes = true;
+
+        gdim = inMsg.offset.back();
+        dspaces_define_gdim(dsp, name.c_str(), 1, &gdim);
+      }
+      auto t2 = redev::getTime();
+
+      std::vector<T> msgs(inMsg.count);
+      if(inMsg.count) {
+        //only call Get with non-zero sized reads
+        lb = inMsg.start;
+        ub = (lb + inMsg.count) - 1;
+        std::cout << "step = " << step <<std::endl;
+        dspaces_get(dsp, name.c_str(), step++, sizeof(T), 1, &lb, &ub, msgs.data(), -1);
+      }
+      
+
+      auto t3 = redev::getTime();
+      std::chrono::duration<double> r1 = t2-t1;
+      std::chrono::duration<double> r2 = t3-t2;
+      if(!rank && verbose) {
+        fprintf(stderr, "recv knownSizes %d r1(sec.) r2(sec.) %f %f\n",
+            inMsg.knownSizes, r1.count(), r2.count());
+      }
+      return msgs;
+    }
+    /**
+     * Return the InMessageLayout object.
+     * @todo should return const object
+     */
+    InMessageLayout GetInMessageLayout() {
+      return inMsg;
+    }
+
+  private:
+    dspaces_client_t dsp;
+    MPI_Comm comm;
+    int recvRanks;
+    std::string name;
+    //support only one call to pack for now...
+    struct OutMessageLayout {
+      LOs dest;
+      LOs offsets;
+    } outMsg;
+    int verbose;
+    //receive side state
+    InMessageLayout inMsg;
+    bool offsetPosted;
+    int offsetStep;
+    int step;
 };
 
 }
