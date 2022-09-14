@@ -8,6 +8,7 @@
 #include <array>          // std::array
 #include <variant>
 #include "dspaces.h"
+#include "dspaces-server.h"
 #include <span>
 
 namespace redev {
@@ -414,6 +415,7 @@ class Redev {
     int rank;
     Partition ptn;
     dspaces_client_t dsp;
+    dspaces_provider_t dsp_srv;
 };
 
 template<typename T>
