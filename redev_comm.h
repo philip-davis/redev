@@ -337,6 +337,7 @@ class DSpacesComm : public Communicator<T> {
         offsetStep = 0;
         step = 0;
         offsetPosted = false;
+        verbose = 0;
     }
     void SetOutMessageLayout(LOs& dest_, LOs& offsets_) {
       REDEV_FUNCTION_TIMER;
@@ -384,15 +385,31 @@ class DSpacesComm : public Communicator<T> {
             const auto srcCountName = name + "_srcCount";
             dspaces_put_meta(dsp, srcCountName.c_str(), offsetStep, &commSz, sizeof(commSz));
         }
-      
-
-        const auto srcRanksName = name+"_srcRanks";
-        uint64_t gdim = commSz * recvRanks;
-        dspaces_define_gdim(dsp, srcRanksName.c_str(), 1, &gdim);
-        lb = recvRanks * rank;
-        ub = lb + (recvRanks - 1);
-        dspaces_put_local(dsp, srcRanksName.c_str(), offsetStep++, sizeof(decltype(rdvRankStart)::value_type), 1, &lb, &ub, rdvRankStart.data());
-
+        int num_srv = dspaces_server_count(dsp); 
+        MPI_Comm srcRanksComm;
+        int color = (rank * num_srv) / commSz;
+        int key = ((rank + num_srv) - color) % num_srv;
+        MPI_Comm_split(comm, color, key, &srcRanksComm);
+        int gatherRank, gatherSz;
+        MPI_Comm_size(srcRanksComm, &gatherSz);
+        MPI_Comm_rank(srcRanksComm, &gatherRank);
+        GOs srcRanksGather;
+        if(!gatherRank) {
+            srcRanksGather.resize(gatherSz * recvRanks);
+        } 
+        MPI_Gather(rdvRankStart.data(), sizeof(GO) * recvRanks, MPI_BYTE,
+                   srcRanksGather.data(), sizeof(GO) * recvRanks, MPI_BYTE,
+                   0, srcRanksComm);
+        int srStartRank;
+        MPI_Reduce(&rank, &srStartRank, 1, MPI_INT, MPI_MIN, 0, srcRanksComm);
+        if(!gatherRank) {
+            const auto srcRanksName = name+"_srcRanks";
+            uint64_t gdim = commSz * recvRanks;
+            dspaces_define_gdim(dsp, srcRanksName.c_str(), 1, &gdim);
+            lb = recvRanks * srStartRank;
+            ub = lb + ((gatherSz * recvRanks) - 1);
+            dspaces_put_local(dsp, srcRanksName.c_str(), offsetStep++, sizeof(decltype(rdvRankStart)::value_type), 1, &lb, &ub, srcRanksGather.data());
+        }
         offsetPosted = true;
 
         gdim = gDegreeTot;
@@ -458,7 +475,6 @@ class DSpacesComm : public Communicator<T> {
         //only call Get with non-zero sized reads
         lb = inMsg.start;
         ub = (lb + inMsg.count) - 1;
-        std::cout << "step = " << step <<std::endl;
         dspaces_get(dsp, name.c_str(), step++, sizeof(T), 1, &lb, &ub, msgs.data(), -1);
       }
       

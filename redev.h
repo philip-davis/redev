@@ -412,10 +412,12 @@ class Redev {
     redev::LO GetServerCommSize(std::string_view name);
     redev::LO GetClientCommSize(std::string_view name);
     MPI_Comm comm;
+    MPI_Comm dsp_comm;
     int rank;
     Partition ptn;
     dspaces_client_t dsp;
     dspaces_provider_t dsp_srv;
+    int srv_step;
 };
 
 template<typename T>

@@ -190,7 +190,7 @@ void sendRecvMapped(MPI_Comm mpiComm, const bool isRdv, const int mbpr,
   auto ranks = redev::LOs(rdvRanks);
   auto cuts = redev::Reals(rdvRanks);
   auto ptn = redev::RCBPtn(dim,ranks,cuts);
-  redev::Redev rdv(mpiComm,std::move(ptn),static_cast<redev::ProcessType>(isRdv));
+  //redev::Redev rdv(mpiComm,std::move(ptn),static_cast<redev::ProcessType>(isRdv));
   //get adios objs
   std::string name = "mapped";
   adios2::ADIOS adios(mpiComm);
@@ -247,6 +247,8 @@ void sendRecvMapped(MPI_Comm mpiComm, const bool isRdv, const int mbpr,
     std::string str = ss.str();
     if(!rank) printTime(str, min, max, avg);
   }
+
+  eng.Close();
 }
 
 int main(int argc, char** argv) {
