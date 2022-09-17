@@ -441,17 +441,30 @@ class DSpacesComm : public Communicator<T> {
       if(!inMsg.knownSizes) {
         const auto offsetsName = name+"_offsets";
         redev::GO *offsetsBuf;
-        dspaces_get_meta(dsp, offsetsName.c_str(), META_MODE_NEXT, -1, &offsetStep, (void **)&offsetsBuf, &size);
-        assert(offsetStep == 0 && size % sizeof(redev::GO) == 0);
+        if(!rank) {
+            dspaces_get_meta(dsp, offsetsName.c_str(), META_MODE_NEXT, -1, &offsetStep, (void **)&offsetsBuf, &size);
+            assert(offsetStep == 0 && size % sizeof(redev::GO) == 0);
+        }
+        MPI_Bcast(&size, 1, MPI_UNSIGNED, 0, comm);
         len = size / sizeof(redev::GO);
-        inMsg.offset.assign(offsetsBuf, offsetsBuf + len);
-        free(offsetsBuf);
+        if(!rank) {
+            inMsg.offset.assign(offsetsBuf, offsetsBuf + len);
+            free(offsetsBuf);
+        } else {
+            inMsg.offset.resize(len);
+        }
+        MPI_Bcast(inMsg.offset.data(), size, MPI_BYTE, 0, comm);
 
         const auto srcCountName = name + "_srcCount";
-        int commSz, *commSzBuf; 
-        dspaces_get_meta(dsp, srcCountName.c_str(), META_MODE_NEXT, -1, &offsetStep, (void **)&commSzBuf, &size);
-        commSz = *commSzBuf;
-        free(commSzBuf);
+        int commSz, *commSzBuf;
+
+        if(!rank) {
+            dspaces_get_meta(dsp, srcCountName.c_str(), META_MODE_NEXT, -1, &offsetStep, (void **)&commSzBuf, &size);
+            assert(size == sizeof(commSz));
+            commSz = *commSzBuf;
+            free(commSzBuf);
+        }
+        MPI_Bcast(&commSz, 1, MPI_INT, 0, comm);
 
         const auto srcRanksName = name + "_srcRanks";
         lb = 0;

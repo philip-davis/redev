@@ -339,16 +339,21 @@ namespace redev {
     MPI_Initialized(&isInitialized);
     REDEV_ALWAYS_ASSERT(isInitialized);
     MPI_Comm_rank(comm, &rank); //set member var
-    if(processType == ProcessType::Server) {
-        char *env_srv_step = std::getenv("DSP_SRV_STEP");
+    char *env_srv_step = std::getenv("DSP_SRV_STEP");
+    char *env_dsp_srv = std::getenv("DSP_SRV");
+    if(env_dsp_srv) {
         if(env_srv_step) {
             srv_step = atoi(env_srv_step);
+        } else {
+            srv_step = 1;
         }
         MPI_Comm_split(comm, rank % srv_step, rank, &dsp_comm);
         if(rank % srv_step == 0) {
             char *conn_str = std::getenv("DSP_SRV_CONN");
             dspaces_server_init(conn_str ? conn_str : "sockets", dsp_comm, "dataspaces.conf", &dsp_srv);
         }
+    } else {
+        srv_step = 0;
     }
     dspaces_init_mpi(comm, &dsp);
   }
@@ -358,7 +363,7 @@ namespace redev {
         dspaces_kill(dsp);
     }
     dspaces_fini(dsp);
-    if(processType == ProcessType::Server && rank % srv_step == 0) {
+    if(srv_step > 0 && rank % srv_step == 0) {
         dspaces_server_fini(dsp_srv);
     }
     MPI_Barrier(comm);
