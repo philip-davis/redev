@@ -381,28 +381,32 @@ class DSpacesComm : public Communicator<T> {
             const auto offsetsName = name+"_offsets";
             const auto oCount = offsets.size();
             dspaces_put_meta(dsp, offsetsName.c_str(), offsetStep, offsets.data(), sizeof(decltype(offsets)::value_type) * oCount);
-        
+            
             const auto srcCountName = name + "_srcCount";
             dspaces_put_meta(dsp, srcCountName.c_str(), offsetStep, &commSz, sizeof(commSz));
         }
         int num_srv = dspaces_server_count(dsp); 
         MPI_Comm srcRanksComm;
+        if(num_srv > commSz) {
+            num_srv = commSz;
+        }
         int color = (rank * num_srv) / commSz;
-        int key = ((rank + num_srv) - color) % num_srv;
+        int key = rank;
         MPI_Comm_split(comm, color, key, &srcRanksComm);
         int gatherRank, gatherSz;
         MPI_Comm_size(srcRanksComm, &gatherSz);
         MPI_Comm_rank(srcRanksComm, &gatherRank);
         GOs srcRanksGather;
-        if(!gatherRank) {
+        int root = color % gatherSz;
+        if(gatherRank == root) {
             srcRanksGather.resize(gatherSz * recvRanks);
-        } 
+        }
         MPI_Gather(rdvRankStart.data(), sizeof(GO) * recvRanks, MPI_BYTE,
                    srcRanksGather.data(), sizeof(GO) * recvRanks, MPI_BYTE,
-                   0, srcRanksComm);
+                   root, srcRanksComm);
         int srStartRank;
-        MPI_Reduce(&rank, &srStartRank, 1, MPI_INT, MPI_MIN, 0, srcRanksComm);
-        if(!gatherRank) {
+        MPI_Reduce(&rank, &srStartRank, 1, MPI_INT, MPI_MIN, root, srcRanksComm);
+        if(gatherRank == root) {
             const auto srcRanksName = name+"_srcRanks";
             uint64_t gdim = commSz * recvRanks;
             dspaces_define_gdim(dsp, srcRanksName.c_str(), 1, &gdim);
@@ -441,39 +445,47 @@ class DSpacesComm : public Communicator<T> {
       if(!inMsg.knownSizes) {
         const auto offsetsName = name+"_offsets";
         redev::GO *offsetsBuf;
-        if(!rank) {
+        if(commSz == 1 || rank == 1) {
             dspaces_get_meta(dsp, offsetsName.c_str(), META_MODE_NEXT, -1, &offsetStep, (void **)&offsetsBuf, &size);
             assert(offsetStep == 0 && size % sizeof(redev::GO) == 0);
         }
-        MPI_Bcast(&size, 1, MPI_UNSIGNED, 0, comm);
-        len = size / sizeof(redev::GO);
-        if(!rank) {
+        if(commSz > 1) {
+            MPI_Bcast(&size, 1, MPI_UNSIGNED, 1, comm);
+            len = size / sizeof(redev::GO);
+        
+            if(rank == 1) {
+                inMsg.offset.assign(offsetsBuf, offsetsBuf + len);
+                free(offsetsBuf);
+            } else {
+                inMsg.offset.resize(len);
+            }
+            MPI_Bcast(inMsg.offset.data(), size, MPI_BYTE, 1, comm);
+        } else {
+            len = size / sizeof(redev::GO);
             inMsg.offset.assign(offsetsBuf, offsetsBuf + len);
             free(offsetsBuf);
-        } else {
-            inMsg.offset.resize(len);
         }
-        MPI_Bcast(inMsg.offset.data(), size, MPI_BYTE, 0, comm);
-
         const auto srcCountName = name + "_srcCount";
-        int commSz, *commSzBuf;
+        int srcSz, *srcSzBuf;
 
         if(!rank) {
-            dspaces_get_meta(dsp, srcCountName.c_str(), META_MODE_NEXT, -1, &offsetStep, (void **)&commSzBuf, &size);
-            assert(size == sizeof(commSz));
-            commSz = *commSzBuf;
-            free(commSzBuf);
+            dspaces_get_meta(dsp, srcCountName.c_str(), META_MODE_NEXT, -1, &offsetStep, (void **)&srcSzBuf, &size);
+            assert(size == sizeof(srcSz));
+            srcSz = *srcSzBuf;
+            free(srcSzBuf);
         }
-        MPI_Bcast(&commSz, 1, MPI_INT, 0, comm);
+        MPI_Bcast(&srcSz, 1, MPI_INT, 0, comm);
 
-        const auto srcRanksName = name + "_srcRanks";
-        lb = 0;
-        ub = ((inMsg.offset.size() - 1) * commSz) - 1;
-        inMsg.srcRanks.resize((inMsg.offset.size() - 1) * commSz);
-        gdim = ub + 1;
-        dspaces_define_gdim(dsp, srcRanksName.c_str(), 1, &gdim);
-        dspaces_get(dsp, srcRanksName.c_str(), 0, sizeof(redev::GO), 1, &lb, &ub, inMsg.srcRanks.data(), -1); 
-
+        inMsg.srcRanks.resize((inMsg.offset.size() - 1) * srcSz);
+        if(!rank) {
+            const auto srcRanksName = name + "_srcRanks";
+            lb = 0;
+            ub = ((inMsg.offset.size() - 1) * srcSz) - 1;
+            gdim = ub + 1;
+            dspaces_define_gdim(dsp, srcRanksName.c_str(), 1, &gdim);
+            dspaces_get(dsp, srcRanksName.c_str(), 0, sizeof(redev::GO), 1, &lb, &ub, inMsg.srcRanks.data(), -1); 
+        }
+        MPI_Bcast(inMsg.srcRanks.data(), sizeof(redev::GO) * (inMsg.offset.size() - 1) * srcSz, MPI_BYTE, 0, comm);
         inMsg.start = static_cast<size_t>(inMsg.offset[rank]);
         inMsg.count = static_cast<size_t>(inMsg.offset[rank+1]-inMsg.start);
         inMsg.knownSizes = true;

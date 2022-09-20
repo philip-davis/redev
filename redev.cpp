@@ -399,8 +399,9 @@ namespace redev {
     redev::LO clientCommSz = 0;
     sprintf(var_name, "%s_%s", name.data(), varName);
     if(processType == ProcessType::Client) {
-      if(!rank)
+      if(!rank) {
         dspaces_put_meta(dsp, var_name, 0, &commSize, sizeof(commSize));
+      }
     } else {
       if(!rank) {
         dspaces_get_meta(dsp, var_name, META_MODE_NEXT, -1, &step, (void **)&sizeMeta, &size);
@@ -409,8 +410,9 @@ namespace redev {
         free(sizeMeta);
       }
     }
-    if(processType==ProcessType::Server)
+    if(processType==ProcessType::Server) {
       redev::Broadcast(&clientCommSz,1,0,comm);
+    }
     return clientCommSz;
   }
 
@@ -428,8 +430,9 @@ namespace redev {
     redev::LO serverCommSz = 0;
     sprintf(var_name, "%s_%s", name.data(), varName);
     if(processType==ProcessType::Server) {
-      if(!rank)
+      if(!rank) {
           dspaces_put_meta(dsp, var_name, 0, &commSize, sizeof(commSize));
+      }
     } else {
       if(!rank) {
         dspaces_get_meta(dsp, var_name, META_MODE_NEXT, -1, &step, (void **)&sizeMeta, &size);
@@ -438,8 +441,9 @@ namespace redev {
         free(sizeMeta);
       }
     }
-    if(processType == ProcessType::Client)
+    if(processType == ProcessType::Client) {
       redev::Broadcast(&serverCommSz,1,0,comm);
+    }
     return serverCommSz;
   }
 
