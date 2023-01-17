@@ -369,7 +369,7 @@ enum class TransportType {
 class Redev {
   public:
     /**
-     * Create a Redev object
+     * Create a Redev server
      * @param[in] comm MPI communicator containing the ranks that are part of the server/client
      * @param[in] ptn PartitionInterface object defining the redezvous domain partition (see note below)
      * @param[in] processProcess enum for if the server is a client, server
@@ -378,7 +378,17 @@ class Redev {
      * The server will send the client the needed partition information during
      * the call to CreateAdiosClient.
      */
-    Redev(MPI_Comm comm, Partition ptn, ProcessType processType = ProcessType::Client, bool noClients= false);
+    Redev(MPI_Comm comm, Partition ptn, ProcessType processType = ProcessType::Server, bool noClients= false);
+    /**
+     * Create a Redev client
+     * @param[in] comm MPI communicator containing the ranks that are part of the server/client
+     * @param[in] processProcess enum for if the server is a client, server
+     * @param[in] noClients for testing without any clients present
+     * The client processes should pass in an empty PartitionInterface object.
+     * The server will send the client the needed partition information during
+     * the call to CreateAdiosClient.
+     */
+    Redev(MPI_Comm comm, ProcessType processType = ProcessType::Client, bool noClients= false);
     /**
      * Create a ADIOS2-based BidirectionalComm between the server and one client
      * @param[in] name name for the communication channel, each BidirectionalComm must have a unique name
@@ -409,8 +419,10 @@ class Redev {
         std::string s2cName, std::string c2sName,
         adios2::IO& s2cIO, adios2::IO& c2sIO,
         adios2::Engine& s2cEngine, adios2::Engine& c2sEngine);
-    redev::LO GetServerCommSize(std::string_view name);
-    redev::LO GetClientCommSize(std::string_view name);
+    redev::LO SendServerCommSizeToClient(std::string_view name);
+    redev::LO SendClientCommSizeToServer(std::string_view name);
+    std::size_t SendPartitionTypeToClient(std::string_view name);
+    void ConstructPartitionFromIndex(size_t partition_index);
     MPI_Comm comm;
     MPI_Comm dsp_comm;
     int rank;
@@ -424,8 +436,8 @@ template<typename T>
 BidirectionalComm<T> Redev::CreateDSpacesClient(std::string_view name) {
   std::string engineType;
   Setup(name);
-  const auto serverRanks = GetServerCommSize(name);
-  const auto clientRanks = GetClientCommSize(name);
+  const auto serverRanks = SendServerCommSizeToClient(name);
+  const auto clientRanks = SendClientCommSizeToServer(name);
   auto s2c = std::make_unique<DSpacesComm<T>>(comm, clientRanks, dsp, std::string(name)+"_s2c");
   auto c2s = std::make_unique<DSpacesComm<T>>(comm, serverRanks, dsp, std::string(name)+"_c2s");
   switch (processType) {

@@ -4,7 +4,6 @@
 #include "redev_git_version.h"
 #include "redev.h"
 #include "redev_profile.h"
-#include "redev_scan.h"
 #include <thread>         // std::this_thread::sleep_for
 #include <chrono>         // std::chrono::seconds
 #include <string>         // std::stoi
@@ -24,7 +23,6 @@ namespace {
     if( (isStreaming && timeoutSet) || isSST ) return;
     std::this_thread::sleep_for(std::chrono::seconds(2));
   }
-
 }
 
 namespace redev {
@@ -53,7 +51,7 @@ namespace redev {
     MPI_Gather(&len,1,MPI_INT,degree.data(),1,MPI_INT,root,comm);
     if(root==rank) {
       auto offset = redev::LOs(commSize+1);
-      redev::exclusive_scan(degree.begin(), degree.end(), offset.begin(), redev::LO(0));
+      std::exclusive_scan(degree.begin(), degree.end(), offset.begin(), redev::LO(0));
       auto allSerialized = redev::LOs(offset.back());
       MPI_Gatherv(serialized.data(), len, MPI_INT, allSerialized.data(),
           degree.data(), offset.data(), MPI_INT, root, MPI_COMM_WORLD);
@@ -131,8 +129,10 @@ namespace redev {
       const auto rank=serialized[i+2];
       ModelEnt ent(dim,id);
       const auto hasEnt = me2r.count(ent);
-      if( (hasEnt && rank < me2r[ent]) || !hasEnt ) {
-        me2r[ModelEnt(dim,id)] = rank;
+      if( !hasEnt ) {
+        me2r[ent] = rank;
+      } else {
+        REDEV_ALWAYS_ASSERT(rank == me2r[ent]);
       }
     }
     return me2r;
@@ -358,6 +358,34 @@ namespace redev {
     dspaces_init_mpi(comm, &dsp);
   }
 
+  Redev::Redev(MPI_Comm comm, ProcessType processType, bool noClients)
+    : comm(comm), ptn(), processType(processType), noClients(noClients) {
+    REDEV_FUNCTION_TIMER;
+    REDEV_ALWAYS_ASSERT(processType == ProcessType::Client);
+    int isInitialized = 0;
+    MPI_Initialized(&isInitialized);
+    REDEV_ALWAYS_ASSERT(isInitialized);
+    MPI_Comm_rank(comm, &rank); //set member var
+    char *env_srv_step = std::getenv("DSP_SRV_STEP");
+    char *env_dsp_srv = std::getenv("DSP_SRV");
+    if(env_dsp_srv) {
+        if(env_srv_step) {
+            srv_step = atoi(env_srv_step);
+        } else {
+            srv_step = 1;
+        }
+        MPI_Comm_split(comm, rank % srv_step, rank, &dsp_comm);
+        if(rank % srv_step == 0) {
+            char *conn_str = std::getenv("DSP_SRV_CONN");
+            dspaces_server_init(conn_str ? conn_str : "sockets", dsp_comm, "dataspaces.conf", &dsp_srv);
+        }
+    } else {
+        srv_step = 0;
+    }
+    dspaces_init_mpi(comm, &dsp);
+
+  }
+
   Redev::~Redev() {
     if(rank == 0) {
         dspaces_kill(dsp);
@@ -370,6 +398,14 @@ namespace redev {
   }
 
   void Redev::Setup(std::string_view name) {
+    // initialize the partition on the client based on how it's set on the server
+    if (processType == ProcessType::Server) {
+      SendPartitionTypeToClient(name);
+    }
+    else {
+      auto partition_index = SendPartitionTypeToClient(name);
+      ConstructPartitionFromIndex(partition_index);
+    }
     REDEV_FUNCTION_TIMER;
     CheckVersion(name);
     //rendezvous app rank 0 writes partition info and other apps read
@@ -385,10 +421,36 @@ namespace redev {
 
   }
 
+  std::size_t Redev::SendPartitionTypeToClient(std::string_view name) {
+    REDEV_FUNCTION_TIMER;
+    char var_name[256];
+    unsigned int idx_size;
+    int step;
+    const auto varName = "redev partition type";
+    std::size_t partition_index = ptn.index();
+    std::size_t *partMeta;
+    sprintf(var_name, "%s_%s", name.data(), varName);
+    if(processType==ProcessType::Server) {
+        if(!rank) {
+            dspaces_put_meta(dsp, var_name, 0, &partition_index, sizeof(partition_index));
+        }
+    } else {
+        if(!rank) {
+            dspaces_get_meta(dsp, var_name, META_MODE_NEXT, -1, &step, (void **)&partMeta, &idx_size);
+            assert(step == 0 && idx_size == sizeof(partition_index));
+            partition_index = *partMeta;
+            free(partMeta);
+        }
+        redev::Broadcast(&partition_index, 1, 0, comm);
+    }
+
+    return(partition_index);
+  }
+
   /*
    * return the number of processes in the client's MPI communicator
    */
-  redev::LO Redev::GetClientCommSize(std::string_view name) {
+  redev::LO Redev::SendClientCommSizeToServer(std::string_view name) {
     REDEV_FUNCTION_TIMER;
     char var_name[256];
     int commSize, step;
@@ -419,7 +481,7 @@ namespace redev {
   /*
    * return the number of processes in the server's MPI communicator
    */
-  redev::LO Redev::GetServerCommSize(std::string_view name) {
+  redev::LO Redev::SendServerCommSizeToClient(std::string_view name) {
     REDEV_FUNCTION_TIMER;
     char var_name[256];
     int commSize, step;
@@ -446,6 +508,23 @@ namespace redev {
     }
     return serverCommSz;
   }
+
+void Redev::ConstructPartitionFromIndex(size_t partition_index) {
+  if(ptn.index() != partition_index) {
+    switch(partition_index) {
+    case 0:
+      ptn.emplace<ClassPtn>();
+      REDEV_ALWAYS_ASSERT(ptn.index() == 0ULL);
+      break;
+    case 1:
+      ptn.emplace<RCBPtn>();
+      REDEV_ALWAYS_ASSERT(ptn.index() == 1ULL);
+      break;
+    default:
+      Redev_Assert_Fail("Unhandled partition type");
+    }
+  }
+}
 
   void Redev::CheckVersion(std::string_view name) {
     REDEV_FUNCTION_TIMER;

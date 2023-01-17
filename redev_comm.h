@@ -3,7 +3,6 @@
 #include "redev_assert.h"
 #include "redev_profile.h"
 #include "redev_assert.h"
-#include "redev_scan.h"
 #include <numeric> // accumulate, exclusive_scan
 #include <type_traits> // is_same
 
@@ -28,6 +27,13 @@ constexpr MPI_Datatype getMpiType(T) noexcept {
   else if constexpr (std::is_same_v<T, std::complex<double>>) { return MPI_DOUBLE_COMPLEX; }
   else if constexpr (std::is_same_v<T, int64_t>) { return MPI_INT64_T; }
   else if constexpr (std::is_same_v<T, int32_t>) { return MPI_INT32_T; }
+  else if constexpr (std::is_same_v<T, uint64_t>) { return MPI_UINT64_T; }
+  // uint64_t is named "unsigned long long" instead of "unsigned long" however these types have the same size
+  else if constexpr (std::is_same_v<T, unsigned long>) {
+    static_assert(sizeof(unsigned long)==sizeof(uint64_t));
+    return MPI_UINT64_T;
+  }
+  else if constexpr (std::is_same_v<T, uint32_t>) { return MPI_UINT32_T; }
   else{ static_assert(detail::dependent_always_false<T>::value, "type has unkown map to MPI_Type"); return {}; }
 }
 
@@ -183,7 +189,7 @@ class AdiosComm : public Communicator<T> {
       const size_t gDegreeTot = static_cast<size_t>(std::accumulate(gDegree.begin(), gDegree.end(), redev::GO(0)));
 
       GOs gStart(recvRanks,0);
-      redev::exclusive_scan(gDegree.begin(), gDegree.end(), gStart.begin(), redev::GO(0));
+      std::exclusive_scan(gDegree.begin(), gDegree.end(), gStart.begin(), redev::GO(0));
 
       //The messages array has a different length on each rank ('irregular') so we don't
       //define local size and count here.
@@ -371,7 +377,7 @@ class DSpacesComm : public Communicator<T> {
       const size_t gDegreeTot = static_cast<size_t>(std::accumulate(gDegree.begin(), gDegree.end(), redev::GO(0)));
 
       GOs gStart(recvRanks,0);
-      redev::exclusive_scan(gDegree.begin(), gDegree.end(), gStart.begin(), redev::GO(0));
+      std::exclusive_scan(gDegree.begin(), gDegree.end(), gStart.begin(), redev::GO(0));
 
       //send dest rank offsets array from rank 0
       auto offsets = gStart;
