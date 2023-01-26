@@ -355,34 +355,34 @@ class DSpacesComm : public Communicator<T> {
       uint64_t lb, ub, gdim;
       MPI_Comm_rank(comm, &rank);
       MPI_Comm_size(comm, &commSz);
-      GOs degree(recvRanks,0); //TODO ideally, this would not be needed
-      for( auto i=0; i<outMsg.dest.size(); i++) {
-        auto destRank = outMsg.dest[i];
-        assert(destRank < recvRanks);
-        degree[destRank] += outMsg.offsets[i+1] - outMsg.offsets[i];
-      }
-      GOs rdvRankStart(recvRanks,0);
-      auto ret = MPI_Exscan(degree.data(), rdvRankStart.data(), recvRanks,
-          getMpiType(redev::GO()), MPI_SUM, comm);
-      assert(ret == MPI_SUCCESS);
-      if(!rank) {
-        //on rank 0 the result of MPI_Exscan is undefined, set it to zero
-        rdvRankStart = GOs(recvRanks,0);
-      }
-
-      GOs gDegree(recvRanks,0);
-      ret = MPI_Allreduce(degree.data(), gDegree.data(), recvRanks,
-          getMpiType(redev::GO()), MPI_SUM, comm);
-      assert(ret == MPI_SUCCESS);
-      const size_t gDegreeTot = static_cast<size_t>(std::accumulate(gDegree.begin(), gDegree.end(), redev::GO(0)));
-
-      GOs gStart(recvRanks,0);
-      std::exclusive_scan(gDegree.begin(), gDegree.end(), gStart.begin(), redev::GO(0));
-
-      //send dest rank offsets array from rank 0
-      auto offsets = gStart;
-      offsets.push_back(gDegreeTot);
       if(!offsetPosted) {
+        GOs degree(recvRanks,0); //TODO ideally, this would not be needed
+        for( auto i=0; i<outMsg.dest.size(); i++) {
+            auto destRank = outMsg.dest[i];
+            assert(destRank < recvRanks);
+            degree[destRank] += outMsg.offsets[i+1] - outMsg.offsets[i];
+        }
+        rdvRankStart.resize(recvRanks,0);
+        auto ret = MPI_Exscan(degree.data(), rdvRankStart.data(), recvRanks,
+            getMpiType(redev::GO()), MPI_SUM, comm);
+        assert(ret == MPI_SUCCESS);
+        if(!rank) {
+            //on rank 0 the result of MPI_Exscan is undefined, set it to zero
+            rdvRankStart = GOs(recvRanks,0);
+        }
+
+        GOs gDegree(recvRanks,0);
+        ret = MPI_Allreduce(degree.data(), gDegree.data(), recvRanks,
+            getMpiType(redev::GO()), MPI_SUM, comm);
+        assert(ret == MPI_SUCCESS);
+        const size_t gDegreeTot = static_cast<size_t>(std::accumulate(gDegree.begin(), gDegree.end(), redev::GO(0)));
+
+        gStart.resize(recvRanks, 0);
+        std::exclusive_scan(gDegree.begin(), gDegree.end(), gStart.begin(), redev::GO(0));
+
+        //send dest rank offsets array from rank 0
+        auto offsets = gStart;
+        offsets.push_back(gDegreeTot);
         if(!rank) {
             const auto offsetsName = name+"_offsets";
             const auto oCount = offsets.size();
@@ -418,7 +418,7 @@ class DSpacesComm : public Communicator<T> {
             dspaces_define_gdim(dsp, srcRanksName.c_str(), 1, &gdim);
             lb = recvRanks * srStartRank;
             ub = lb + ((gatherSz * recvRanks) - 1);
-            dspaces_put_local(dsp, srcRanksName.c_str(), offsetStep++, sizeof(decltype(rdvRankStart)::value_type), 1, &lb, &ub, srcRanksGather.data());
+            dspaces_put_local(dsp, srcRanksName.c_str(), offsetStep++, sizeof(GO), 1, &lb, &ub, srcRanksGather.data());
         }
         offsetPosted = true;
 
@@ -513,10 +513,12 @@ class DSpacesComm : public Communicator<T> {
       auto t3 = redev::getTime();
       std::chrono::duration<double> r1 = t2-t1;
       std::chrono::duration<double> r2 = t3-t2;
+      /*
       if(!rank && verbose) {
         fprintf(stderr, "recv knownSizes %d r1(sec.) r2(sec.) %f %f\n",
             inMsg.knownSizes, r1.count(), r2.count());
       }
+      */
       return msgs;
     }
     /**
@@ -543,6 +545,8 @@ class DSpacesComm : public Communicator<T> {
     bool offsetPosted;
     int offsetStep;
     int step;
+    GOs gStart;
+    GOs rdvRankStart;
 };
 
 }
